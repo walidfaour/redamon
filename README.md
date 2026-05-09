@@ -218,19 +218,22 @@ All lifecycle management is handled by a single script:
 
 | Command | Description |
 |---------|-------------|
-| `./redamon.sh install` | Build + start without GVM |
+| `./redamon.sh install` | Build + start lightweight (no GVM, no Knowledge Base, Tavily-only web search) |
+| `./redamon.sh install --kbase` | Build + start with the local Knowledge Base (~4.4 GB heavier) |
 | `./redamon.sh install --gvm` | Build + start with GVM/OpenVAS |
-| `./redamon.sh install --skipkbase` | Build without Knowledge Base (~4.4 GB lighter, Tavily-only) |
-| **`./redamon.sh update`** | **Pull latest version, smart-rebuild only changed services** |
-| `./redamon.sh up` | Start services (auto-detects GVM mode) |
-| `./redamon.sh up dev` | Start in dev mode with hot-reload (auto-detects GVM mode) |
+
+> Flags can be combined: `./redamon.sh install --gvm --kbase`
+
+| Command | Description |
+|---------|-------------|
+| **`./redamon.sh update`** | **Pull latest version, smart-rebuild only changed services (preserves your install-time GVM/KB choice)** |
+| `./redamon.sh up` | Start services (auto-detects GVM and KB mode from install) |
+| `./redamon.sh up dev` | Start in dev mode with hot-reload (auto-detects GVM and KB mode) |
 | `./redamon.sh down` | Stop services (preserves data) |
-| `./redamon.sh status` | Show running services, version, GVM mode |
+| `./redamon.sh status` | Show running services, version, GVM mode, KB state |
 | `./redamon.sh clean` | Remove containers + images, keep data |
 | `./redamon.sh reset-password` | Reset a user's password from the terminal |
 | `./redamon.sh purge` | Remove everything including all data |
-
-> Flags can be combined: `./redamon.sh install --skipkbase --gvm`
 
 
 ### Updating to a New Version
@@ -306,15 +309,15 @@ docker container prune -f                         # Remove stopped containers
 
 The agent's `web_search` tool includes a local **Knowledge Base** -- a RAG pipeline that searches curated security datasets (GTFOBins, LOLBAS, OWASP WSTG, NVD CVEs, ExploitDB, Nuclei templates, and agent skill docs) before falling back to Tavily web search. When the KB returns a high-confidence match, Tavily is skipped entirely for faster, offline-capable results.
 
-**How it works:** During `install` / `up` / `restart`, RedAmon automatically builds a lightweight KB index (~1,200 chunks in 10-15 min on CPU). At query time, the agent runs a hybrid retrieval pipeline (FAISS vector search + Neo4j fulltext), reranks with a cross-encoder, and checks a confidence threshold. If the score is high enough, results come from the local KB. Otherwise, it falls back to Tavily or merges both.
+**How it works:** When the KB is enabled, `install` / `up` / `restart` builds a lightweight KB index (~1,200 chunks in 10-15 min on CPU). At query time, the agent runs a hybrid retrieval pipeline (FAISS vector search + Neo4j fulltext), reranks with a cross-encoder, and checks a confidence threshold. If the score is high enough, results come from the local KB. Otherwise, it falls back to Tavily or merges both.
 
-**Default behavior:** The KB is enabled by default. On first install, it detects your hardware (GPU / CPU / API) and offers a quick-start option. No configuration needed.
-
-**Skip it entirely:** If you don't need the local KB (e.g., limited disk space), use `--skipkbase` to build a ~4.4 GB lighter image with Tavily-only web search:
+**Default behavior:** The KB is **opt-in**. `./redamon.sh install` produces a lightweight install (~4.4 GB lighter, Tavily-only web search). To enable the local KB, pass `--kbase`:
 
 ```bash
-./redamon.sh install --skipkbase
+./redamon.sh install --kbase
 ```
+
+On first install with `--kbase`, RedAmon detects your hardware (GPU / CPU / API) and offers a quick-start profile. The choice is persisted, so subsequent `update` / `up` commands respect it without re-passing the flag.
 
 **Speed up ingestion with API embeddings:** By default, embeddings run locally on CPU/GPU. On CPU-only machines, large datasets (ExploitDB, NVD) can take hours. You can offload embedding to an external API by creating a `.env` file from the template:
 

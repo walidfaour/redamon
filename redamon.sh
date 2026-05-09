@@ -515,12 +515,12 @@ _kb_get_neo4j_count() {
 
 cmd_install() {
     local gvm_mode="false"
-    local skipkbase="false"
+    local kbase_mode="false"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --gvm)       gvm_mode="true" ;;
-            --skipkbase) skipkbase="true" ;;
+            --gvm)   gvm_mode="true" ;;
+            --kbase) kbase_mode="true" ;;
             *) error "Unknown flag: $1"; exit 1 ;;
         esac
         shift
@@ -539,13 +539,19 @@ cmd_install() {
         info "Mode: Core services (without GVM/OpenVAS)"
         rm -f "$GVM_FLAG_FILE"
     fi
-    if [[ "$skipkbase" == "true" ]]; then
-        info "Mode: Skipping Knowledge Base (--skipkbase)"
+    # KB is OPT-IN at install time. The .skipkbase flag (legacy name) drives
+    # is_skipkbase() which is also read by cmd_update/cmd_up/cmd_up_dev,
+    # so those commands stay invariant for existing installs:
+    #   - touched here on default install -> KB disabled across update/up
+    #   - removed here on --kbase install  -> KB enabled across update/up
+    if [[ "$kbase_mode" == "true" ]]; then
+        info "Mode: Including Knowledge Base (--kbase)"
+        rm -f "$SKIPKBASE_FLAG_FILE"
+    else
+        info "Mode: Skipping Knowledge Base (default; pass --kbase to enable)"
         export SKIP_KB="true"
         export KB_ENABLED="false"
         touch "$SKIPKBASE_FLAG_FILE"
-    else
-        rm -f "$SKIPKBASE_FLAG_FILE"
     fi
     echo ""
 
@@ -1210,9 +1216,9 @@ cmd_help() {
     echo -e "${BOLD}Usage:${NC} ./redamon.sh <command> [options]"
     echo ""
     echo -e "${BOLD}Commands:${NC}"
-    echo -e "  ${GREEN}install${NC}              Build and start RedAmon (without GVM)"
+    echo -e "  ${GREEN}install${NC}              Build and start RedAmon (no GVM, no Knowledge Base)"
     echo -e "  ${GREEN}install --gvm${NC}        Build and start RedAmon (with GVM/OpenVAS)"
-    echo -e "  ${GREEN}install --skipkbase${NC}  Build without Knowledge Base (~4.4 GB lighter)"
+    echo -e "  ${GREEN}install --kbase${NC}      Build with Knowledge Base (~4.4 GB heavier, local KB enabled)"
     echo -e "  ${GREEN}update${NC}           Pull latest version and smart-rebuild changed services"
     echo -e "  ${GREEN}up${NC}               Start services"
     echo -e "  ${GREEN}up dev${NC}           Start in dev mode (hot-reload, auto-detects GVM mode)"
@@ -1224,9 +1230,10 @@ cmd_help() {
     echo -e "  ${GREEN}help${NC}             Show this help message"
     echo ""
     echo -e "${BOLD}Examples:${NC}"
-    echo "  ./redamon.sh install               # First-time setup (no GVM)"
-    echo "  ./redamon.sh install --gvm         # First-time setup (full stack)"
-    echo "  ./redamon.sh install --skipkbase   # Lightweight (Tavily-only, no KB)"
+    echo "  ./redamon.sh install               # First-time setup (lightweight: no GVM, no KB)"
+    echo "  ./redamon.sh install --kbase       # First-time setup with local Knowledge Base"
+    echo "  ./redamon.sh install --gvm         # First-time setup with GVM/OpenVAS"
+    echo "  ./redamon.sh install --gvm --kbase # First-time setup with everything"
     echo "  ./redamon.sh update           # Update to latest version"
     echo "  ./redamon.sh up               # Start after reboot"
     echo "  ./redamon.sh up dev           # Dev mode with hot-reload (auto-detects GVM)"
