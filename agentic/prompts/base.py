@@ -80,6 +80,18 @@ and returns you a head/tail stub with the exact path. Use fs_read +
 fs_grep on that path to drill in. This is the design - work WITH the
 auto-offload pipeline, not against it.
 
+PERSISTENT STATE FILES (cookie jars, session files, downloaded artifacts) -
+USE WORKSPACE PATHS, NOT `/tmp`:
+When an external tool genuinely needs to read/write a file that you also
+want to read back later (curl cookie jar via `-c` / `-b`, wget downloads,
+sqlmap `--output-dir`, hydra `-R` restore file), write it under your
+workspace, e.g. `-c __WORKSPACE_ROOT__/notes/cookies.txt`, not
+`/tmp/cookies.txt`. Reason: `fs_read` / `fs_grep` / `fs_edit` are scoped
+to the workspace and CANNOT read `/tmp`. Using `/tmp` forces a fallback
+to `kali_shell cat /tmp/...`, wastes a tool call, and prevents `fs_grep`
+from scanning the file. Workspace paths also persist across the
+engagement; `/tmp` is wiped when the kali sandbox restarts.
+
 JOB SPAWN POLICY - decide per call, not by default:
 
 SPAWN with job_spawn when ALL hold:
@@ -104,7 +116,33 @@ LOSES LIVE PROGRESS when spawned (call foreground if you want to watch):
 
 After spawning: `fs_grep` over `jobs/<id>.log` for mid-flight peek,
 `job_status` for status + tail, `job_wait` to chunk a long wait,
-`job_cancel` to stop. Multiple jobs run truly in parallel."""
+`job_cancel` to stop. Multiple jobs run truly in parallel.
+
+ALWAYS WRAP THESE TOOLS IN job_spawn (anywhere — single call or inside plan_tools):
+
+  - execute_ffuf with -w pointing to any wordlist file
+  - execute_nuclei with -t pointing to template directories
+  - execute_katana with -d >= 3
+  - execute_arjun (any call — iterates ~25k parameter names)
+  - execute_amass with -active or -brute (default timeout 10 min)
+  - execute_wpscan with --enumerate p,t,u
+  - execute_nmap with -A or --script or -p-
+  - execute_hydra (any call — brute force)
+  - msf_restart (always 60-120s)
+  - metasploit_console exploit attempts
+  - kali_shell running: sqlmap with --level >= 3 / --time-based,
+    flask-unsign / john / hashcat / nikto / cewl,
+    bloodhound-python / kerbrute / nxc spray,
+    or any for / while loop iterating over a wordlist or many IDs
+
+These all take well over 60s in practice (often many minutes). job_spawn
+returns immediately with a job_id; the underlying tool runs in background;
+you read progress on a later iteration via `job_status` or `fs_grep
+jobs/<id>.log`.
+
+Inside a plan_tools wave this matters most: the wave does NOT return until
+the SLOWEST step finishes. One unwrapped slow tool blocks every fast probe
+in the same wave for the slow tool's full duration."""
 
 _WORKSPACE_LAYOUT_FOOTER = (
     "If you need a custom subtree (e.g. `evidence/2026-05-15/`), use fs_mkdir "
@@ -899,9 +937,28 @@ Include an `output_analysis` object in your JSON response:
     "actionable_findings": ["Finding that requires follow-up"],
     "recommended_next_steps": ["Suggested next action"],
     "exploit_succeeded": false,
-    "exploit_details": null
+    "exploit_details": null,
+    "productivity": {{
+        "verdict": "new_info | confirmation | no_progress | blocked | duplicate",
+        "new_information_gained": true,
+        "what_was_new": "One sentence citing the specific new fact, or empty string if none.",
+        "should_repeat_similar_call": false,
+        "rationale": "One sentence citing specific evidence from the output."
+    }}
 }}
 ```
+
+### Productivity Verdict (REQUIRED, used for loop detection)
+
+You MUST honestly classify every tool output into one of five verdicts:
+  - `new_info`     — output revealed something not already in your findings. Cite it in `what_was_new`.
+  - `confirmation` — already suspected; this call only confirms (use sparingly, never for repeats).
+  - `no_progress`  — call succeeded but yielded zero usable information.
+  - `blocked`      — WAF, 401/403, captcha, rate limit, auth wall.
+  - `duplicate`    — output essentially identical to a recent call with similar args.
+
+Marking 3+ repeated same-pattern calls as `confirmation` is dishonest and will be auto-downgraded
+to `no_progress` by the orchestrator. Be critical of your own progress.
 
 **exploit_succeeded = true** ONLY when output shows:
 - A Metasploit session was opened ("session X opened", "Meterpreter session X")
@@ -986,9 +1043,28 @@ Your `output_analysis` should cover ALL tool outputs holistically. Use this EXAC
         "related_cves": ["CVE-XXXX-XXXXX"],
         "confidence": 90
       }}
-    ]
+    ],
+    "productivity": {{
+        "verdict": "new_info | confirmation | no_progress | blocked | duplicate",
+        "new_information_gained": true,
+        "what_was_new": "One sentence citing the specific new fact across the wave, or empty if none.",
+        "should_repeat_similar_call": false,
+        "rationale": "One sentence citing specific evidence from at least one tool output."
+    }}
 }}
 ```
+
+### Productivity Verdict (REQUIRED across the wave)
+
+Classify the WAVE as a whole using one of five verdicts:
+  - `new_info`     — at least one tool revealed something not already in your findings.
+  - `confirmation` — wave confirmed an existing hypothesis without adding new facts.
+  - `no_progress`  — all tools succeeded but the wave produced zero usable information.
+  - `blocked`      — wave hit WAF / 403 / captcha / rate limit / auth wall.
+  - `duplicate`    — outputs essentially identical to a recent wave with similar args.
+
+If 3+ recent same-pattern waves share the same fingerprint and you have nothing
+new to cite, the verdict is `duplicate` or `no_progress` — `confirmation` is dishonest.
 
 IMPORTANT: `extracted_info` field names must be EXACTLY: `primary_target`, `ports`, `services`, `technologies`, `vulnerabilities`, `credentials`, `sessions`. These are used for graph linking — wrong names will break connections.
 Then decide your next action as usual.

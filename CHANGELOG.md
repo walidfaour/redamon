@@ -6,7 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
- 
+
+
+## [4.10.1] - 2026-05-17
+
+### Added
+
+- **Productivity-based loop detection** ([agentic/orchestrator_helpers/productivity.py](agentic/orchestrator_helpers/productivity.py), [agentic/state.py](agentic/state.py), [agentic/prompts/base.py](agentic/prompts/base.py)) — every tool output is classified by the LLM into one of five verdicts (`new_info` / `confirmation` / `no_progress` / `blocked` / `duplicate`) with mandatory `what_was_new` citation. The orchestrator audits the claim against actual state delta (chain_findings growth, extracted_info population) and auto-downgrades dishonest verdicts to `no_progress`, surfacing the reason in the next prompt. A same-pattern fingerprint audit (sha256 over normalized response body) is appended when 3+ recent calls share the same tool-and-args shape, making repeated "confirmation" claims visibly dishonest.
+
+- **Unproductive-streak Deep Think trigger** ([agentic/orchestrator_helpers/nodes/think_node.py](agentic/orchestrator_helpers/nodes/think_node.py), [agentic/orchestrator_helpers/nodes/fireteam_member_think_node.py](agentic/orchestrator_helpers/nodes/fireteam_member_think_node.py), [agentic/project_settings.py](agentic/project_settings.py)) — replaces the legacy "3 consecutive failures" rule. When `UNPRODUCTIVE_STREAK_THRESHOLD` (default 3) of the last `PRODUCTIVITY_AUDIT_WINDOW` (default 6) steps are unproductive (LLM verdict OR keyword-failure), Deep Think fires and a pivot warning is injected. Catches "successful but useless" loops (HTTP 200 with empty body, identical fuzzing fingerprints, stable 404s, polite WAF HTML) that the keyword-only detector missed. Mirrored in fireteam member subgraphs.
+
+- **Workspace-path guidance for persistent state files** ([agentic/prompts/base.py](agentic/prompts/base.py)) — prompt now instructs the agent to write curl cookie jars, sqlmap output dirs, hydra restore files under `__WORKSPACE_ROOT__/notes/` instead of `/tmp`, so `fs_read` / `fs_grep` / `fs_edit` can reach them and they persist across kali-sandbox restarts.
+
+### Fixed
+
+- **Loop detector missed successful-but-useless calls** ([agentic/orchestrator_helpers/nodes/think_node.py](agentic/orchestrator_helpers/nodes/think_node.py)) — the old check only counted steps whose output contained `"failed"` / `"error"` / `"exploit completed, but no session"` AND required them to be consecutive, so empty-body 200s, repeated WAF-blocked HTML, and identical fuzzing iterations would never trip the pivot. Sliding-window N-of-K count over LLM-classified unproductive steps removes both gaps.
+
+
+---
+
 
 ## [4.10.0] - 2026-05-15
 

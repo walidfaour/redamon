@@ -217,6 +217,7 @@ internal/
 
 # Benchmark data
 bmark/
+validation-benchmarks/
 
 # Knowledge base runtime data
 knowledge_base/data/

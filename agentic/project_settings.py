@@ -128,6 +128,17 @@ DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
     # Deep Think (Strategic Reasoning)
     'DEEP_THINK_ENABLED': True,
 
+    # Productivity Audit & Loop Detection
+    # The orchestrator audits the LLM's per-step productivity verdict
+    # (no_progress / duplicate / blocked / new_info / confirmation) and counts
+    # unproductive steps in a sliding window. When the count crosses the
+    # threshold, Deep Think is triggered (if enabled) and a prompt warning is
+    # injected. Catches "successful but useless" tool calls (HTTP 200 with
+    # empty body, identical fuzzing fingerprints, stable 404s) that the
+    # legacy keyword-only failure detector missed.
+    'PRODUCTIVITY_AUDIT_WINDOW': 6,         # how many recent steps the audit considers
+    'UNPRODUCTIVE_STREAK_THRESHOLD': 3,     # unproductive steps in window to trigger pivot
+
     # Debug
     'CREATE_GRAPH_IMAGE_ON_INIT': False,
 

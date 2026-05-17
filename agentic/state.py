@@ -296,6 +296,24 @@ class ChainFindingExtract(BaseModel):
     step_iteration: int = 0
 
 
+class ProductivityVerdict(BaseModel):
+    """LLM-emitted verdict on whether the last tool call advanced the engagement.
+
+    Consumed by the orchestrator's loop detector in place of keyword-based
+    failure heuristics. The closed `verdict` enum prevents free-form dodging
+    and the rationale + what_was_new fields force the model to cite evidence.
+
+    The orchestrator cross-checks `new_information_gained` against actual
+    state delta (findings_grew, extracted_info populated) and downgrades
+    dishonest claims to `no_progress` before the loop counter consumes it.
+    """
+    verdict: Literal["new_info", "confirmation", "no_progress", "blocked", "duplicate"] = "new_info"
+    new_information_gained: bool = True
+    what_was_new: str = Field(default="", description="One sentence; empty if nothing new.")
+    should_repeat_similar_call: bool = False
+    rationale: str = Field(default="", description="One sentence citing specific evidence from the output.")
+
+
 class OutputAnalysisInline(BaseModel):
     """Inline output analysis embedded in LLMDecision when tool output is pending."""
     interpretation: str = ""
@@ -305,6 +323,7 @@ class OutputAnalysisInline(BaseModel):
     exploit_succeeded: bool = False
     exploit_details: Optional[dict] = None
     chain_findings: List[ChainFindingExtract] = Field(default_factory=list)
+    productivity: ProductivityVerdict = Field(default_factory=ProductivityVerdict)
 
 
 # =============================================================================

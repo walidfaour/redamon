@@ -24,6 +24,11 @@ from orchestrator_helpers.parsing import try_parse_llm_decision
 from orchestrator_helpers.json_utils import normalize_content, json_dumps_safe
 from orchestrator_helpers.llm_retry import retry_llm_call
 import orchestrator_helpers.chain_graph_writer as chain_graph
+from orchestrator_helpers.productivity import (
+    audit_productivity_claim,
+    build_productivity_audit_section,
+    downgrade_verdict_to_no_progress,
+)
 from project_settings import get_setting, get_allowed_tools_for_phase, DANGEROUS_TOOLS
 from tools import set_tenant_context, set_phase_context, set_graph_view_context
 
@@ -454,7 +459,14 @@ Include `output_analysis`:
             "related_ips": [],
             "confidence": 80
         }}
-    ]
+    ],
+    "productivity": {{
+        "verdict": "new_info | confirmation | no_progress | blocked | duplicate",
+        "new_information_gained": true,
+        "what_was_new": "One sentence citing the specific new fact, or empty if none.",
+        "should_repeat_similar_call": false,
+        "rationale": "One sentence citing specific evidence from the output."
+    }}
 }}
 ```
 
@@ -466,7 +478,19 @@ output shows nothing security-relevant.
 Set `exploit_succeeded = true` ONLY when output shows a Meterpreter session
 opened, cracked credentials returned, or a command proved RCE (uid=0, file
 read, etc.). When true, populate `exploit_details` with target_ip, cve_ids,
-and evidence."""
+and evidence.
+
+### Productivity Verdict (REQUIRED, used for loop detection)
+
+Classify the output honestly:
+  - `new_info`     — revealed something not already in your findings. Cite it in what_was_new.
+  - `confirmation` — confirms an existing hypothesis without new facts (rare; never for repeats).
+  - `no_progress`  — call succeeded but yielded no usable information.
+  - `blocked`      — WAF / 401/403 / captcha / rate limit / auth wall.
+  - `duplicate`    — output essentially identical to a recent call with similar args.
+
+Marking 3+ repeated same-pattern calls as `confirmation` is dishonest and
+auto-downgraded to `no_progress` by the orchestrator."""
 
 
 _MEMBER_PENDING_PLAN_OUTPUTS_SECTION = """
@@ -497,12 +521,31 @@ real time with YOUR attribution, anchored to each ChainStep in the wave.
           "severity": "info|low|medium|high|critical",
           "title": "one-line", "evidence": "from output above",
           "related_cves": [], "related_ips": [], "confidence": 80}}
-    ]
+    ],
+    "productivity": {{
+        "verdict": "new_info | confirmation | no_progress | blocked | duplicate",
+        "new_information_gained": true,
+        "what_was_new": "One sentence citing the specific new fact across the wave, or empty if none.",
+        "should_repeat_similar_call": false,
+        "rationale": "One sentence citing specific evidence from at least one tool output."
+    }}
 }}
 ```
 
 One finding per distinct fact across ALL tools. Do NOT hallucinate — ground
-every finding in the raw output above."""
+every finding in the raw output above.
+
+### Productivity Verdict (REQUIRED across the wave)
+
+Classify the WAVE as a whole:
+  - `new_info`     — at least one tool revealed something not already known.
+  - `confirmation` — wave confirmed existing hypothesis without new facts.
+  - `no_progress`  — all tools succeeded but no usable information produced.
+  - `blocked`      — wave hit WAF / 403 / captcha / rate limit / auth wall.
+  - `duplicate`    — outputs essentially identical to a recent wave with similar args.
+
+`confirmation` is dishonest after 3+ repeated same-pattern waves — the
+orchestrator will auto-downgrade to `no_progress`."""
 
 
 def _build_pending_output_section(state: FireteamMemberState) -> str:
@@ -677,6 +720,25 @@ def _build_member_prompt(state: FireteamMemberState) -> str:
         peer_block = ""
 
     pending_output_section = _build_pending_output_section(state)
+
+    # Productivity audit: show the member its own recent same-pattern fingerprints
+    # so claiming "confirmation" 10x in a row becomes visibly dishonest. Also
+    # surface the prior-iteration downgrade reason if any. Empty strings until
+    # there are 3+ same-pattern recent calls — zero cost for productive members.
+    _audit_section = build_productivity_audit_section(
+        state.get("execution_trace") or [],
+        window=int(get_setting('PRODUCTIVITY_AUDIT_WINDOW', 6)),
+    )
+    if _audit_section:
+        pending_output_section = (pending_output_section or "") + "\n" + _audit_section
+    _last_discrepancy = state.get("_last_productivity_discrepancy")
+    if _last_discrepancy:
+        pending_output_section = (pending_output_section or "") + (
+            "\n\n## Prior Productivity Claim Was Downgraded\n\n"
+            f"Reason: {_last_discrepancy}\n"
+            "Be more critical about your verdict this turn — empty/duplicate outputs "
+            "are not 'confirmation'.\n"
+        )
 
     # Soft tool-expansion budget (Change C). Surfaces a graduated warning when
     # the member has reached into the fallback toolbox without producing new
@@ -1275,6 +1337,38 @@ async def fireteam_member_think_node(
         )
         completed_step["actionable_findings"] = list(analysis.actionable_findings or [])
         completed_step["recommended_next_steps"] = list(analysis.recommended_next_steps or [])
+
+        # Persist productivity verdict on the step + audit it against state delta.
+        _productivity_dict = (
+            analysis.productivity.model_dump()
+            if getattr(analysis, "productivity", None) else {}
+        )
+        _findings_will_grow = bool(
+            (analysis.chain_findings or [])
+            or (analysis.exploit_succeeded and analysis.exploit_details)
+            or (analysis.actionable_findings and not analysis.chain_findings)
+        )
+        _discrepancy = audit_productivity_claim(
+            productivity=_productivity_dict,
+            extracted_info=(
+                analysis.extracted_info.model_dump()
+                if analysis.extracted_info else {}
+            ),
+            actionable_findings=analysis.actionable_findings or [],
+            findings_grew=_findings_will_grow,
+        )
+        if _discrepancy:
+            _productivity_dict = downgrade_verdict_to_no_progress(
+                _productivity_dict, _discrepancy,
+            )
+            logger.info(
+                f"[{member_id}] productivity verdict downgraded to no_progress: {_discrepancy}"
+            )
+            update["_last_productivity_discrepancy"] = _discrepancy
+        else:
+            update["_last_productivity_discrepancy"] = None
+        completed_step["productivity"] = _productivity_dict
+
         update["execution_trace"] = list(state.get("execution_trace") or []) + [completed_step]
 
         # Signal the streaming layer to emit `fireteam_tool_complete` for this
@@ -1319,6 +1413,39 @@ async def fireteam_member_think_node(
         merged_target = TargetInfo(**(state.get("target_info") or {}))
         member_findings_memory = list(state.get("chain_findings_memory") or [])
         new_trace_entries = []
+
+        # Wave-level productivity verdict (one verdict shared by all wave steps).
+        _wave_productivity: dict = {}
+        if analysis is not None:
+            _wave_productivity = (
+                analysis.productivity.model_dump()
+                if getattr(analysis, "productivity", None) else {}
+            )
+            _wave_findings_will_grow = bool(
+                (analysis.chain_findings or [])
+                or (analysis.exploit_succeeded and analysis.exploit_details)
+                or (analysis.actionable_findings and not analysis.chain_findings)
+            )
+            _wave_discrepancy = audit_productivity_claim(
+                productivity=_wave_productivity,
+                extracted_info=(
+                    analysis.extracted_info.model_dump()
+                    if analysis.extracted_info else {}
+                ),
+                actionable_findings=analysis.actionable_findings or [],
+                findings_grew=_wave_findings_will_grow,
+            )
+            if _wave_discrepancy:
+                _wave_productivity = downgrade_verdict_to_no_progress(
+                    _wave_productivity, _wave_discrepancy,
+                )
+                logger.info(
+                    f"[{member_id}] wave productivity verdict downgraded to "
+                    f"no_progress: {_wave_discrepancy}"
+                )
+                update["_last_productivity_discrepancy"] = _wave_discrepancy
+            else:
+                update["_last_productivity_discrepancy"] = None
 
         combined_extracted: dict = {}
         if analysis and analysis.extracted_info:
@@ -1365,6 +1492,7 @@ async def fireteam_member_think_node(
                 "output_analysis": step_output_analysis,
                 "actionable_findings": list(analysis.actionable_findings or []) if analysis else [],
                 "recommended_next_steps": list(analysis.recommended_next_steps or []) if analysis else [],
+                "productivity": dict(_wave_productivity) if _wave_productivity else {},
             }
             new_trace_entries.append(exec_step)
 

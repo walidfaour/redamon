@@ -28,6 +28,12 @@ from orchestrator_helpers.json_utils import json_dumps_safe, normalize_content
 from orchestrator_helpers.parsing import try_parse_llm_decision
 from orchestrator_helpers.config import get_identifiers, is_session_config_complete
 from orchestrator_helpers.llm_retry import retry_llm_call
+from orchestrator_helpers.productivity import (
+    audit_productivity_claim,
+    build_productivity_audit_section,
+    downgrade_verdict_to_no_progress,
+    is_unproductive,
+)
 from project_settings import get_setting, get_allowed_tools_for_phase, DANGEROUS_TOOLS
 
 from prompts import (
@@ -124,24 +130,33 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
         elif just_transitioned:
             trigger_reason = f"Phase transition to {just_transitioned} — re-evaluating strategy"
 
-        # Condition 3: failure loop (3+ consecutive failures)
+        # Condition 3: failure / unproductive loop in last N steps
+        # Counts both hard failures (success=False, "failed"/"error" keywords)
+        # AND steps the LLM itself classified as no_progress/duplicate/blocked
+        # via output_analysis.productivity. Catches the "successful but useless"
+        # case (e.g. HTTP 200 with empty body repeated N times) that the
+        # keyword-only check missed.
         _exec_trace = state.get("execution_trace", [])
-        if not trigger_reason and len(_exec_trace) >= 3:
-            _consecutive = 0
-            for _step in reversed(_exec_trace[-6:]):
+        _window = int(get_setting('PRODUCTIVITY_AUDIT_WINDOW', 6))
+        _threshold = int(get_setting('UNPRODUCTIVE_STREAK_THRESHOLD', 3))
+        if not trigger_reason and len(_exec_trace) >= _threshold:
+            _unproductive_count = 0
+            for _step in _exec_trace[-_window:]:
                 _out = ((_step.get("tool_output") or "")[:500]).lower()
-                _is_fail = (
+                _is_keyword_fail = (
                     not _step.get("success", True)
                     or "failed" in _out
                     or "error" in _out
                     or "exploit completed, but no session" in _out
                 )
-                if _is_fail:
-                    _consecutive += 1
-                else:
-                    break
-            if _consecutive >= 3:
-                trigger_reason = f"Failure loop detected ({_consecutive} consecutive failures) — pivoting strategy"
+                if _is_keyword_fail or is_unproductive(_step):
+                    _unproductive_count += 1
+            if _unproductive_count >= _threshold:
+                trigger_reason = (
+                    f"Unproductive streak detected ({_unproductive_count}/{_window} "
+                    f"recent steps yielded no_progress / duplicate / blocked / failure) "
+                    f"— pivoting strategy"
+                )
 
         # Condition 4: LLM self-requested deep think on previous iteration
         if not trigger_reason and state.get("_need_deep_think", False):
@@ -334,36 +349,53 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                 "If the engagement has ended, do NOT perform any active testing."
             )
 
-    # Failure loop detection: if 3+ consecutive similar failures, inject warning
+    # Unproductive-streak detection: inject a prompt warning if N of last K steps
+    # were failures OR the LLM classified them as no_progress / duplicate / blocked.
+    # Catches both hard errors and "successful but useless" calls.
     exec_trace = state.get("execution_trace", [])
-    if len(exec_trace) >= 3:
-        consecutive_failures = 0
-        last_pattern = None
-        for step in reversed(exec_trace[-6:]):
+    _audit_window = int(get_setting('PRODUCTIVITY_AUDIT_WINDOW', 6))
+    _audit_threshold = int(get_setting('UNPRODUCTIVE_STREAK_THRESHOLD', 3))
+    if len(exec_trace) >= _audit_threshold:
+        unproductive_count = 0
+        for step in exec_trace[-_audit_window:]:
             output_lower = ((step.get("tool_output") or "")[:500]).lower()
-            is_failure = (
+            is_keyword_failure = (
                 not step.get("success", True)
                 or "failed" in output_lower
                 or "error" in output_lower
                 or "exploit completed, but no session" in output_lower
             )
-            if is_failure:
-                pattern = f"{step.get('tool_name')}:{str(step.get('tool_args', {}))[:80]}"
-                if last_pattern is None or pattern == last_pattern:
-                    consecutive_failures += 1
-                    last_pattern = pattern
-                else:
-                    break
-            else:
-                break
+            if is_keyword_failure or is_unproductive(step):
+                unproductive_count += 1
 
-        if consecutive_failures >= 3:
+        if unproductive_count >= _audit_threshold:
             system_prompt += (
-                "\n\n## FAILURE LOOP DETECTED\n\n"
-                "You have failed 3+ times with a similar approach. You MUST try a completely "
-                "different strategy: use `web_search` for alternative techniques, try a different "
-                "tool or payload, or use action='ask_user' for guidance. Do NOT retry the same approach.\n"
+                "\n\n## UNPRODUCTIVE STREAK DETECTED\n\n"
+                f"{unproductive_count} of your last {_audit_window} steps yielded no_progress, "
+                "duplicate, blocked, or hard-failure outcomes. You MUST try a completely different "
+                "strategy this turn: switch tool family, switch vulnerability hypothesis, use "
+                "`web_search` for alternative techniques, or use action='ask_user' for guidance. "
+                "Do NOT retry the same approach with adjacent parameters.\n"
             )
+
+    # Productivity audit section: show the model its own recent same-pattern
+    # fingerprints. Empty string if fewer than 3 same-pattern recent calls.
+    _audit_section = build_productivity_audit_section(
+        exec_trace, window=_audit_window,
+    )
+    if _audit_section:
+        system_prompt += "\n" + _audit_section
+
+    # Surface any prior-iteration discrepancy note so the model sees it before
+    # filling productivity again.
+    _last_discrepancy = state.get("_last_productivity_discrepancy")
+    if _last_discrepancy:
+        system_prompt += (
+            "\n\n## Prior Productivity Claim Was Downgraded\n\n"
+            f"Reason: {_last_discrepancy}\n"
+            "Be more critical about your verdict this turn — empty/duplicate outputs are "
+            "not 'confirmation'.\n"
+        )
 
     # CHECK: Is there a pending tool output to analyze?
     pending_step = state.get("_current_step")
@@ -681,6 +713,45 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
             pending_step["actionable_findings"] = analysis.actionable_findings or []
             pending_step["recommended_next_steps"] = analysis.recommended_next_steps or []
 
+            # Persist the LLM's productivity verdict on the step so the loop
+            # detector and subsequent prompts can read it back.
+            _productivity_dict = (
+                analysis.productivity.model_dump()
+                if getattr(analysis, "productivity", None)
+                else {}
+            )
+
+            # Honesty audit: cross-check the verdict against actual state delta.
+            # If the LLM claims new info but nothing actually changed, downgrade.
+            _prior_findings_count = len(state.get("chain_findings_memory", []) or [])
+            _findings_will_grow = bool(
+                (analysis.chain_findings or [])
+                or (analysis.exploit_succeeded and analysis.exploit_details)
+                or (analysis.actionable_findings and not analysis.chain_findings)
+            )
+            _discrepancy = audit_productivity_claim(
+                productivity=_productivity_dict,
+                extracted_info=(
+                    analysis.extracted_info.model_dump()
+                    if analysis.extracted_info else {}
+                ),
+                actionable_findings=analysis.actionable_findings or [],
+                findings_grew=_findings_will_grow,
+            )
+            if _discrepancy:
+                _productivity_dict = downgrade_verdict_to_no_progress(
+                    _productivity_dict, _discrepancy,
+                )
+                logger.info(
+                    f"[{user_id}/{project_id}/{session_id}] Productivity verdict "
+                    f"downgraded to no_progress: {_discrepancy}"
+                )
+                updates["_last_productivity_discrepancy"] = _discrepancy
+            else:
+                updates["_last_productivity_discrepancy"] = None
+
+            pending_step["productivity"] = _productivity_dict
+
             # Log analysis results
             logger.info(f"\n{'='*60}")
             logger.info(f"OUTPUT ANALYSIS (inline) - Iteration {iteration} - Phase: {phase}")
@@ -869,6 +940,40 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
         chain_failures_mem = list(state.get("chain_failures_memory", []))
         new_trace_entries = []
 
+        # Productivity verdict for the whole wave (one verdict shared across
+        # all steps in the wave). Audited against actual state delta.
+        _wave_productivity: dict = {}
+        if analysis:
+            _wave_productivity = (
+                analysis.productivity.model_dump()
+                if getattr(analysis, "productivity", None) else {}
+            )
+            _wave_findings_will_grow = bool(
+                (analysis.chain_findings or [])
+                or (analysis.exploit_succeeded and analysis.exploit_details)
+                or (analysis.actionable_findings and not analysis.chain_findings)
+            )
+            _wave_discrepancy = audit_productivity_claim(
+                productivity=_wave_productivity,
+                extracted_info=(
+                    analysis.extracted_info.model_dump()
+                    if analysis.extracted_info else {}
+                ),
+                actionable_findings=analysis.actionable_findings or [],
+                findings_grew=_wave_findings_will_grow,
+            )
+            if _wave_discrepancy:
+                _wave_productivity = downgrade_verdict_to_no_progress(
+                    _wave_productivity, _wave_discrepancy,
+                )
+                logger.info(
+                    f"[{user_id}/{project_id}/{session_id}] Wave productivity "
+                    f"verdict downgraded to no_progress: {_wave_discrepancy}"
+                )
+                updates["_last_productivity_discrepancy"] = _wave_discrepancy
+            else:
+                updates["_last_productivity_discrepancy"] = None
+
         if analysis:
             logger.info(f"\n{'='*60}")
             logger.info(f"PLAN OUTPUT ANALYSIS (combined) - {len(plan_steps)} tools")
@@ -966,6 +1071,9 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                 "output_analysis": step_output_analysis,
                 "actionable_findings": (analysis.actionable_findings or []) if analysis else [],
                 "recommended_next_steps": (analysis.recommended_next_steps or []) if analysis else [],
+                # Wave-level productivity verdict copied onto every wave step so
+                # the loop detector can read it from any single step in isolation.
+                "productivity": dict(_wave_productivity) if _wave_productivity else {},
             }
             new_trace_entries.append(exec_step)
 
