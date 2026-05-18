@@ -900,18 +900,12 @@ async def fireteam_member_think_node(
     if graph_view_cyphers:
         set_graph_view_context(graph_view_cyphers.get(session_id))
 
-    # ---- Budget enforcement (before any LLM call) ----
+    # Iteration budget is enforced by _route_after_member_think (strict-greater
+    # so the LLM gets one analysis pass after the cap is hit, persisting the
+    # final wave's chain_findings). tokens_used is accumulated below for
+    # passive observability only (metrics, report, UI).
     current_iter = state.get("current_iteration", 0)
     max_iter = state.get("max_iterations", 15)
-    if current_iter >= max_iter:
-        logger.info("[%s] member %s iteration budget exhausted (%d/%d)", session_id, member_id, current_iter, max_iter)
-        return {
-            "task_complete": True,
-            "completion_reason": "iteration_budget_exceeded",
-        }
-
-    # Iteration budget is the sole runtime cap; tokens_used is accumulated
-    # below for passive observability only (metrics, report, UI).
     tokens_used = state.get("tokens_used", 0)
 
     # ---- LLM call with parse-retry loop (mirrors root think_node) ----
@@ -1589,12 +1583,30 @@ async def fireteam_member_think_node(
         else:
             update["_current_plan"] = None
 
+    # Iteration budget signal: if we entered this call with current_iter
+    # already at max, the LLM has just run the post-budget analysis pass on
+    # the last wave's output. Set task_complete + completion_reason so the
+    # streaming layer and FireteamMemberResult see the right terminate reason.
+    # The router-side cap in _route_after_member_think (strict-greater) is
+    # the actual routing signal; this is for observability and to suppress
+    # the dangerous-tool escalation below (no point pausing for operator
+    # approval when the member is about to exit).
+    if current_iter >= max_iter:
+        update["task_complete"] = True
+        update["completion_reason"] = "iteration_budget_exceeded"
+        logger.info(
+            "[%s] member %s analysis pass after budget exhaustion (%d/%d) — terminating",
+            session_id, member_id, current_iter, max_iter,
+        )
+
     # Dangerous-tool escalation runs AFTER analysis-write so the prior wave's
     # chain_findings, target_info merge, and Neo4j writes commit before we
     # pause for operator approval. `_pending_confirmation` is the router's
     # signal to fireteam_await_confirmation — its placement in this function
     # does not affect routing, only whether analysis-write fires first.
-    if is_dangerous:
+    # Skipped when budget is exhausted (above): the member is terminating,
+    # so a new dangerous wave should not be queued for operator approval.
+    if is_dangerous and not update.get("task_complete"):
         pending = _build_pending_confirmation(decision, state)
         update["_pending_confirmation"] = pending
         # Populate _current_plan / _current_step so they survive the await
