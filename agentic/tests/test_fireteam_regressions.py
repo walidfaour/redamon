@@ -1295,5 +1295,239 @@ class WaveClockBackwardsCompatRegression(unittest.IsolatedAsyncioTestCase):
         )
 
 
+# =============================================================================
+# BUG: Renderer dropped per-tool detail across iterations, leaving the
+# Self-Check duplicate-target rule unable to fire.
+# =============================================================================
+#
+# format_chain_context renders the member's "Your local progress in this
+# run" block (and the parent context inside members, and the main agent's
+# trace) via four branches: older-tier summary, recent wave, recent single
+# tool, and last-tool reattachment. Each branch lost different per-tool
+# detail:
+#   - Older tier kept only the LLM's analysis text — no tool_args, no
+#     tool_output. Self-Check rule could not fire on iterations beyond
+#     the recent window.
+#   - Recent wave kept tool args but dropped tool_output entirely. The
+#     LLM at iter N had to guess what prior probes returned.
+#   - Recent single tool wrote (analysis or output) into the OK line, so
+#     analysis shadowed raw output once it was written.
+#   - Last-tool 5000ch reattachment only fired for the very last shown
+#     tool — every prior iteration's raw output was lost.
+#
+# Fix (changes A+B+C+D in state.py:format_chain_context):
+#   A) Older tier: per-iteration `tools: name(args[:80])` digest line.
+#   B) Older tier: append 60-char output fingerprint per tool to the digest.
+#   C) Recent wave: per-tool `-> preview` (200ch) line under the args line.
+#   D) Recent single: separate `Raw: ...` (300ch) line when both analysis
+#      and raw output are present.
+
+
+class FormatChainContextPreservesPerToolDetailRegression(unittest.TestCase):
+    """Locks the four-part renderer fix in agentic/state.py."""
+
+    def _older_tier_trace(self):
+        """15-iter trace; with recent_iterations=5 this puts iters 1-10 in
+        the older tier and 11-15 in the recent window."""
+        trace = []
+        # Older iters: each runs a single tool with a distinctive arg.
+        for i in range(1, 11):
+            trace.append({
+                "iteration": i,
+                "phase": "informational",
+                "tool_name": "kali_shell",
+                "tool_args": {"command": f"dig +short host{i}.example.com A"},
+                "tool_output": f"10.0.0.{i}",
+                "success": True,
+                "output_analysis": f"DNS resolved host{i} cleanly.",
+            })
+        # Recent window: 5 iters of single-tool execution.
+        for i in range(11, 16):
+            trace.append({
+                "iteration": i,
+                "phase": "informational",
+                "tool_name": "kali_shell",
+                "tool_args": {"command": f"curl -IL http://host{i}.example.com"},
+                "tool_output": f"HTTP/1.1 200 OK\nServer: nginx/{i}",
+                "success": True,
+                "output_analysis": f"Host {i} alive on HTTP.",
+            })
+        return trace
+
+    def test_A_older_tier_digest_includes_tool_args(self):
+        """Change A: the older tier must surface tool args via a `tools:`
+        digest line so the duplicate-target rule has args to match on for
+        iterations beyond the recent window."""
+        from state import format_chain_context
+
+        rendered = format_chain_context(
+            chain_findings=[], chain_failures=[], chain_decisions=[],
+            execution_trace=self._older_tier_trace(),
+            recent_iterations=5,
+        )
+
+        # Older-tier section header present.
+        self.assertIn("Earlier Steps", rendered,
+                      "older tier header missing; older iterations may have "
+                      "been kept in recent window unintentionally")
+
+        # A: older iter 1's tool args visible via digest line.
+        self.assertIn("dig +short host1.example.com A", rendered,
+                      "older-tier digest missing for iter 1; Self-Check rule "
+                      "cannot match prior dig calls beyond recent window")
+        self.assertIn("dig +short host5.example.com A", rendered,
+                      "older-tier digest missing for iter 5")
+
+        # The line should be the new `tools:` follow-up, not the existing
+        # analysis line; check the prefix.
+        self.assertRegex(rendered, r"tools: kali_shell\(",
+                         "expected `tools: name(args)` digest format")
+
+    def test_B_older_tier_digest_includes_output_fingerprint(self):
+        """Change B: the digest line must also include a tiny output
+        fingerprint so the LLM can spot 'I already got this answer'."""
+        from state import format_chain_context
+
+        rendered = format_chain_context(
+            chain_findings=[], chain_failures=[], chain_decisions=[],
+            execution_trace=self._older_tier_trace(),
+            recent_iterations=5,
+        )
+
+        # Output for iter 1 was "10.0.0.1" — must appear in the fingerprint.
+        self.assertIn("10.0.0.1", rendered,
+                      "older-tier output fingerprint missing; LLM cannot "
+                      "tell that prior dig already returned this answer")
+        # Format: `name(args) -> fingerprint`
+        self.assertRegex(rendered, r"kali_shell\([^)]*dig[^)]*\) -> 10\.0\.0\.",
+                         "expected `name(args) -> fingerprint` format in digest")
+
+    def test_C_wave_recent_includes_per_tool_output_preview(self):
+        """Change C: multi-tool wave in the recent window must show a
+        per-tool output preview under each args line."""
+        from state import format_chain_context
+
+        wave_trace = [
+            {
+                "iteration": 1, "phase": "informational",
+                "tool_name": "kali_shell",
+                "tool_args": {"command": "dig +short target.example.com A"},
+                "tool_output": "203.0.113.42",
+                "success": True,
+                "output_analysis": "Recon wave completed.",
+            },
+            {
+                "iteration": 1, "phase": "informational",
+                "tool_name": "kali_shell",
+                "tool_args": {"command": "curl -IL http://target.example.com"},
+                "tool_output": "HTTP/1.1 200 OK\nServer: nginx/1.18\nDate: now",
+                "success": True,
+                "output_analysis": "Recon wave completed.",
+            },
+            {
+                "iteration": 1, "phase": "informational",
+                "tool_name": "kali_shell",
+                "tool_args": {"command": "subfinder -d target.example.com"},
+                "tool_output": "api.target.example.com\nstaging.target.example.com",
+                "success": True,
+                "output_analysis": "Recon wave completed.",
+            },
+        ]
+        rendered = format_chain_context(
+            chain_findings=[], chain_failures=[], chain_decisions=[],
+            execution_trace=wave_trace,
+            recent_iterations=5,
+        )
+
+        # The Tools: block must render each tool's preview on its own line.
+        self.assertIn("203.0.113.42", rendered,
+                      "C: dig output preview missing from wave rendering")
+        self.assertIn("HTTP/1.1 200 OK", rendered,
+                      "C: curl output preview missing from wave rendering")
+        # The preview must be on a continuation line, not folded into args.
+        self.assertRegex(rendered, r"->\s*203\.0\.113\.42",
+                         "expected `-> preview` continuation under args line")
+        # Newlines in the raw output must be collapsed to spaces.
+        self.assertNotIn("HTTP/1.1 200 OK\nServer:", rendered,
+                         "C: newlines in wave preview not collapsed; "
+                         "multi-line output disrupts the trace structure")
+
+    def test_D_single_tool_recent_surfaces_raw_alongside_analysis(self):
+        """Change D: single-tool entries must show a separate `Raw:` line
+        when both analysis and tool_output are non-empty. Pre-fix the
+        analysis shadowed the raw output entirely."""
+        from state import format_chain_context
+
+        single_trace = [
+            {
+                "iteration": 1, "phase": "informational",
+                "tool_name": "kali_shell",
+                "tool_args": {"command": "curl -I https://api.example.com/v1"},
+                "tool_output": "HTTP/1.1 401 Unauthorized\nWWW-Authenticate: Bearer realm=\"api\"",
+                "success": True,
+                "output_analysis": "API endpoint returned 401; auth required.",
+            },
+            # Second iteration so the first is NOT the last shown — otherwise
+            # the existing 5000ch last-tool reattachment would mask the bug.
+            {
+                "iteration": 2, "phase": "informational",
+                "tool_name": "kali_shell",
+                "tool_args": {"command": "dig +short api.example.com A"},
+                "tool_output": "10.0.0.99",
+                "success": True,
+                "output_analysis": "DNS resolved.",
+            },
+        ]
+        rendered = format_chain_context(
+            chain_findings=[], chain_failures=[], chain_decisions=[],
+            execution_trace=single_trace,
+            recent_iterations=10,
+        )
+
+        # The analysis line is still there.
+        self.assertIn("API endpoint returned 401", rendered,
+                      "D: analysis line lost; rendering broke")
+        # The new Raw: line must surface the actual response headers.
+        self.assertIn("WWW-Authenticate", rendered,
+                      "D: raw HTTP response header missing; analysis still "
+                      "shadows raw output")
+        self.assertRegex(rendered, r"Raw:\s*HTTP/1\.1 401",
+                         "expected `Raw:` line carrying the raw response")
+
+    def test_no_regression_on_empty_or_failed_tools(self):
+        """Robustness: a tool with no output, a failed tool, and an empty
+        trace must not crash or emit malformed lines."""
+        from state import format_chain_context
+
+        # Failed tool — no output expected.
+        trace_failed = [{
+            "iteration": 1, "phase": "informational",
+            "tool_name": "kali_shell",
+            "tool_args": {"command": "nmap unreachable.host"},
+            "tool_output": "",
+            "success": False,
+            "error_message": "connection refused",
+            "output_analysis": "Target unreachable.",
+        }]
+        rendered = format_chain_context(
+            chain_findings=[], chain_failures=[], chain_decisions=[],
+            execution_trace=trace_failed,
+            recent_iterations=5,
+        )
+        self.assertIn("FAILED", rendered)
+        # Failed tools must NOT carry a Raw: line (no successful output).
+        self.assertNotIn("Raw:", rendered)
+        # And no preview arrow (-> ...) from C either, because preview is
+        # gated on success.
+        self.assertNotIn("\n      -> ", rendered)
+
+        # Empty trace path is unchanged.
+        empty = format_chain_context(
+            chain_findings=[], chain_failures=[], chain_decisions=[],
+            execution_trace=[],
+        )
+        self.assertEqual(empty, "No steps executed yet.")
+
+
 if __name__ == "__main__":
     unittest.main()
