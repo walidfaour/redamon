@@ -86,8 +86,8 @@ ENV DOTNET_ROOT="/usr/share/dotnet"
 
 # Copy requirements first for better caching.
 # NOTE: build context is the project root (./), not ./agentic — see docker-compose.yml
-COPY agentic/requirements.txt .
-COPY agentic/requirements-kb.txt .
+COPY agentic/requirements.txt ./
+COPY agentic/requirements-kb.txt ./
 
 # Core Python dependencies (always installed)
 RUN pip install --no-cache-dir -r requirements.txt
